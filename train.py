@@ -43,6 +43,8 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
+# tensorboard logging
+tb_log = True
 # data
 dataset = 'openwebtext'
 gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
@@ -245,6 +247,9 @@ def get_lr(it):
 if wandb_log and master_process:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+if tb_log and master_process:
+    from torch.utils.tensorboard import SummaryWriter
+    writer = SummaryWriter(log_dir=os.path.join(out_dir, 'tb_logs'))
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -262,15 +267,27 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        train_ppl = torch.exp(losses['train'])
+        val_ppl = torch.exp(losses['val'])
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, train ppl {train_ppl:.2f}, "
+              f"val loss {losses['val']:.4f}, val ppl {val_ppl:.2f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
+                "train/ppl": train_ppl,
                 "val/loss": losses['val'],
+                "val/ppl": val_ppl,
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+        if tb_log:
+            writer.add_scalar('train/loss', losses['train'], iter_num)
+            writer.add_scalar('train/ppl', train_ppl, iter_num)
+            writer.add_scalar('val/loss', losses['val'], iter_num)
+            writer.add_scalar('val/ppl', val_ppl, iter_num)
+            writer.add_scalar('lr', lr, iter_num)
+            writer.add_scalar('mfu', running_mfu*100, iter_num)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
