@@ -27,12 +27,12 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from gpt2_model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out'
+out_dir = 'out/gpt2-124M-owt'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -42,7 +42,7 @@ init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
-wandb_run_name = 'gpt2' # 'run' + str(time.time())
+wandb_run_name = 'gpt2-124M' # 'run' + str(time.time())
 # tensorboard logging
 tb_log = True
 # data
@@ -267,25 +267,18 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        train_ppl = torch.exp(losses['train'])
-        val_ppl = torch.exp(losses['val'])
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, train ppl {train_ppl:.2f}, "
-              f"val loss {losses['val']:.4f}, val ppl {val_ppl:.2f}")
+        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
-                "train/ppl": train_ppl,
                 "val/loss": losses['val'],
-                "val/ppl": val_ppl,
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
         if tb_log:
             writer.add_scalar('train/loss', losses['train'], iter_num)
-            writer.add_scalar('train/ppl', train_ppl, iter_num)
             writer.add_scalar('val/loss', losses['val'], iter_num)
-            writer.add_scalar('val/ppl', val_ppl, iter_num)
             writer.add_scalar('lr', lr, iter_num)
             writer.add_scalar('mfu', running_mfu*100, iter_num)
         if losses['val'] < best_val_loss or always_save_checkpoint:
@@ -300,7 +293,12 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                ckpt_file = os.path.join(out_dir, 'ckpt.pt')
+                temp_file = os.path.join(out_dir, 'temp.pt')
+                torch.save(checkpoint, temp_file) # first, save to a temporary file
+                if os.path.exists(ckpt_file):
+                    os.remove(ckpt_file) # only then remove the old checkpoint
+                os.rename(temp_file, ckpt_file) # and rename the temporary file
     if iter_num == 0 and eval_only:
         break
 

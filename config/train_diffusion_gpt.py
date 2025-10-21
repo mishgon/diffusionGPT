@@ -1,10 +1,10 @@
-# config for training GPT-2 (124M) down to very nice loss of ~2.85 on 1 node of 8X A100 40GB
+# config for training diffusion-GPT (124M) down to very nice loss of ? on 1 node of 8X A100 40GB
 # launch as the following (e.g. in a screen session) and wait ~5 days:
-# $ torchrun --standalone --nproc_per_node=8 train_gpt2.py config/train_gpt2.py
+# $ torchrun --standalone --nproc_per_node=8 train_diffusion_gpt.py config/train_diffusion_gpt.py
 
 wandb_log = False
 wandb_project = 'owt'
-wandb_run_name='gpt2-124M'
+wandb_run_name='diffusion-gpt-124M'
 
 tb_log = True
 
