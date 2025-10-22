@@ -22,6 +22,7 @@ import math
 import pickle
 from contextlib import nullcontext
 import warnings
+from collections import defaultdict
 
 import numpy as np
 import torch
@@ -57,9 +58,9 @@ n_layer = 12
 n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
-bias = False # do we use bias inside LayerNorm and Linear layers?
 n_lm_heads = 1
 cce_impl = 'none'  # TODO: try different implementations
+alpha = 1e-2
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
 max_iters = 600000 # total number of training iterations
@@ -160,8 +161,7 @@ best_val_loss = 1e9
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=vocab_size, dropout=dropout,
-                  n_lm_heads=n_lm_heads, cce_impl=cce_impl) # start with model_args from command line
+                  vocab_size=vocab_size, dropout=dropout, n_lm_heads=n_lm_heads, cce_impl=cce_impl, alpha=alpha) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -177,7 +177,7 @@ elif init_from == 'resume':
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size', 'n_lm_heads']:
+    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'vocab_size', 'n_lm_heads']:
         assert model_args[k] == checkpoint_model_args[k], (f'can\'t resume training, because {k} is different '
                                                            f'for the current run ({model_args[k]}) and '
                                                            f'for the saved checkpoint ({checkpoint_model_args[k]})')
@@ -219,19 +219,21 @@ if ddp:
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
-def estimate_loss():
-    out = {}
+def estimate_scalars():
+    mean_scalars = defaultdict(list)
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             batch = get_batch(split)
             with ctx:
-                _, loss = model(*batch)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+                _, _, scalars = model(*batch)
+            for k, v in scalars.items():
+                mean_scalars[f'{split}/{k}'].append(v)
+    for k, v in mean_scalars.items():
+        assert v
+        mean_scalars[k] = sum(v) / len(v)
     model.train()
-    return out
+    return mean_scalars
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -270,23 +272,22 @@ while True:
 
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
-        losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        scalars = estimate_scalars()
+        print(f"step {iter_num}: train loss {scalars['train/loss']:.4f}, val loss {scalars['val/loss']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
+                **scalars,
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
         if tb_log:
-            writer.add_scalar('train/loss', losses['train'], iter_num)
-            writer.add_scalar('val/loss', losses['val'], iter_num)
+            for k, v in scalars.items():
+                writer.add_scalar(k, v, iter_num)
             writer.add_scalar('lr', lr, iter_num)
             writer.add_scalar('mfu', running_mfu*100, iter_num)
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
+        if scalars['val/loss'] < best_val_loss or always_save_checkpoint:
+            best_val_loss = scalars['val/loss']
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -316,7 +317,7 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            _, loss = model(*batch)
+            _, loss, _ = model(*batch)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         batch = get_batch('train')

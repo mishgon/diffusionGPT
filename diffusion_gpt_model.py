@@ -7,8 +7,6 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-from gpt2_model import LayerNorm, MLP
-
 @dataclass
 class DiffusionGPTConfig:
     block_size: int = 1024
@@ -17,20 +15,32 @@ class DiffusionGPTConfig:
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     n_lm_heads: int = 1 # p(x | x^t) = \sum_k \pi_k \prod_i p^k(x_i | x^t)
     cce_impl: str = 'none'
+    alpha: float = 1e-2
 
-# copy-paste CausalSelfAttention from model.py, but remove causal masking
+def precompute_rope(max_seq_len, attn_head_dim):
+    pos = torch.arange(max_seq_len)
+    freqs = torch.exp(-math.log(10_000) * torch.arange(0, attn_head_dim, 2, dtype=torch.float32) / attn_head_dim)
+    rope = torch.outer(pos, freqs)  # (seq_len + max_context_len, dim)
+    rope = torch.polar(torch.ones_like(rope), rope)
+    return rope
+
+def apply_rope(q_or_k, rope):
+    dtype = q_or_k.dtype
+    q_or_k = torch.view_as_complex(q_or_k.float().view(*q_or_k.shape[:-1], -1, 2))  # (b, n_head, l, head_dim // 2)
+    q_or_k = torch.view_as_real(q_or_k * rope).flatten(3)  # (N, n_head, L, head_dim)
+    return q_or_k.to(dtype)
+
 class SelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
         # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
+        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
@@ -42,7 +52,7 @@ class SelfAttention(nn.Module):
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
-    def forward(self, x):
+    def forward(self, x, rope):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -50,6 +60,10 @@ class SelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        
+        # apply rotary positional encodings
+        q = apply_rope(q, rope)
+        k = apply_rope(k, rope)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
@@ -67,19 +81,34 @@ class SelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-# copy-paste Block from model.py, but replace CausalSelfAttention with SelfAttention
+class MLP(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
+        self.gelu    = nn.GELU()
+        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        self.dropout = nn.Dropout(config.dropout)
+
+    def forward(self, x):
+        x = self.c_fc(x)
+        x = self.gelu(x)
+        x = self.c_proj(x)
+        x = self.dropout(x)
+        return x
+
 class Block(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.norm_1 = nn.RMSNorm(config.n_embd, eps=1e-6)
         self.attn = SelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.norm_2 = nn.RMSNorm(config.n_embd, eps=1e-6)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
+    def forward(self, x, rope):
+        x = x + self.attn(self.norm_1(x), rope)
+        x = x + self.mlp(self.norm_2(x))
         return x
 
 class DiffusionGPT(nn.Module):
@@ -90,12 +119,14 @@ class DiffusionGPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        rope = precompute_rope(max_seq_len=config.block_size + 1, attn_head_dim=config.n_embd // config.n_head)
+        self.register_buffer('rope', rope)
+
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size + 1, config.n_embd), # add CLS token
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            norm_f = nn.RMSNorm(config.n_embd, eps=1e-6),
         ))
         if config.n_lm_heads == 1:
             self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
@@ -137,8 +168,6 @@ class DiffusionGPT(nn.Module):
         params are actually used as weights in the final layer, so we include them.
         """
         n_params = sum(p.numel() for p in self.parameters())
-        if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
         return n_params
 
     def _init_weights(self, module):
@@ -163,68 +192,92 @@ class DiffusionGPT(nn.Module):
         # append CLS token
         cls_token_ids = torch.full(size=(b, 1), fill_value=self.cls_token_id, dtype=input_ids.dtype, device=device)
         input_ids = torch.cat((cls_token_ids, input_ids), dim=1)
-        pos = torch.arange(0, l + 1, dtype=torch.long, device=device) # shape (l + 1)
+        rope = self.rope[:(l + 1)]
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(input_ids) # token embeddings of shape (b, l + 1, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (l + 1, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+            x = block(x, rope)
+        x = self.transformer.norm_f(x)
 
-        if target_ids is not None:
-            assert mask is not None
-            assert p_mask is not None
+        if target_ids is None:
+            return x, None, None
 
-            if self.config.n_lm_heads == 1:
-                x = x[:, 1:].contiguous()  # drop CLS token, we do not need it in the basic case
-                if self.config.cce_impl == 'none':
-                    logits = self.lm_head(x) # (b, l, vocab_size)
-                    logits[:, :, self.mask_token_id] = float('-inf') # zero prob of MASK token
-                    logits[:, :, self.cls_token_id] = float('-inf') # zero prob of CLS token
-                    nll = F.cross_entropy(logits.view(-1, logits.size(-1)), target_ids.view(-1), reduction='none').view(b, l)
-                else:
-                    # significantly reduces memory footprint, see https://arxiv.org/abs/2411.09009v2
-                    from cut_cross_entropy import linear_cross_entropy
-                    w = self.lm_head.weight[:-2] # remove logits corresponding to MASK and CLS tokens
-                    nll = linear_cross_entropy(x.view(-1, x.size(-1)), w, target_ids.view(-1),
-                                               reduction='none', impl=self.config.cce_impl).view(b, l)
-                nll = (nll * mask).sum(1) # carry-over masking
+        assert mask is not None
+        assert p_mask is not None
+
+        # basic case with single lm head
+        if self.config.n_lm_heads == 1:
+            x = x[:, 1:].contiguous()  # drop CLS token, we do not need it in the basic case
+            if self.config.cce_impl == 'none':
+                logits = self.lm_head(x) # (b, l, vocab_size)
+                logits[:, :, self.mask_token_id] = float('-inf') # zero prob of MASK token
+                logits[:, :, self.cls_token_id] = float('-inf') # zero prob of CLS token
+                nll = F.cross_entropy(logits.view(-1, logits.size(-1)), target_ids.view(-1), reduction='none').view(b, l)
             else:
-                with warnings.catch_warnings():
-                    # using log_softmax with torch.compile causes an annoying warning for some reason
-                    warnings.filterwarnings("ignore", message=".*Online softmax is disabled.*")
-                    log_pi = torch.log_softmax(self.pi_head(x[:, 0]), dim=-1) # (b, n_lm_heads)
-                x = x[:, 1:].contiguous()
-                nll_per_head = []
-                for lm_head in self.lm_heads:
-                    if self.config.cce_impl == 'none':
-                        logits = lm_head(x) # (b, l, vocab_size)
-                        logits[:, :, self.mask_token_id] = float('-inf') # zero prob of MASK token
-                        logits[:, :, self.cls_token_id] = float('-inf') # zero prob of CLS token
-                        nll = F.cross_entropy(logits.view(-1, logits.size(-1)), target_ids.view(-1), reduction='none').view(b, l)
-                    else:
-                        from cut_cross_entropy import linear_cross_entropy
-                        w = lm_head.weight[:-2] # remove logits corresponding to MASK and CLS tokens
-                        nll = linear_cross_entropy(x.view(-1, x.size(-1)), w, target_ids.view(-1),
-                                                   reduction='none', impl=self.config.cce_impl).view(b, l)
-                    nll = (nll * mask).sum(1) # carry-over masking
-                    nll_per_head.append(nll)
-                nll_per_head = torch.stack(nll_per_head, dim=1) # (b, n_lm_heads)
-                nll = -torch.logsumexp(log_pi - nll_per_head, dim=1) # (b,)
-
+                # significantly reduces memory footprint, see https://arxiv.org/abs/2411.09009v2
+                from cut_cross_entropy import linear_cross_entropy
+                w = self.lm_head.weight[:-2] # remove logits corresponding to MASK and CLS tokens
+                nll = linear_cross_entropy(x.view(-1, x.size(-1)), w, target_ids.view(-1),
+                                            reduction='none', impl=self.config.cce_impl).view(b, l)
+            nll = (nll * mask).sum(1) # carry-over masking
             # division by p_mask below follows from math (see ELBO in https://arxiv.org/pdf/2406.07524),
             # but it also makes perfect sense for the following general reason:
             # nll loss is sum over masked tokens (for unmasked tokens we have zero loss due to carry-over masking)
             # for large p_mask, many tokens are masked and nll loss is larger
             # for small p_mask, a few tokens are masked and nll loss is smaller
             # division by p_mask rescales nll loss, such that the model is equally penalized for all p_mask from [0, 1] range
-            loss = torch.mean(nll / p_mask) / l
-        else:
-            loss = None
+            elbo_loss = torch.mean(nll / p_mask) / l
+            scalars = {
+                'loss': elbo_loss.item(),
+                'elbo_loss': elbo_loss.item(),
+            }
+            return x, elbo_loss, scalars
 
-        return x, loss
+        # case with multiple lm heads
+        pi_logits = self.pi_head(x[:, 0]) # (b, n_lm_heads)
+        pi = torch.softmax(pi_logits, dim=-1)
+        with warnings.catch_warnings():
+            # using log_softmax with torch.compile causes an annoying warning for some reason
+            warnings.filterwarnings("ignore", message=".*Online softmax is disabled.*")
+            log_pi = torch.log_softmax(pi_logits, dim=-1)
+        pi_argmax = F.one_hot(pi_logits.argmax(dim=-1), num_classes=pi_logits.size(-1)).to(pi.dtype)
+
+        x = x[:, 1:].contiguous()
+        nll_per_head = []
+        for lm_head in self.lm_heads:
+            if self.config.cce_impl == 'none':
+                logits = lm_head(x) # (b, l, vocab_size)
+                logits[:, :, self.mask_token_id] = float('-inf') # zero prob of MASK token
+                logits[:, :, self.cls_token_id] = float('-inf') # zero prob of CLS token
+                nll = F.cross_entropy(logits.view(-1, logits.size(-1)), target_ids.view(-1), reduction='none').view(b, l)
+            else:
+                from cut_cross_entropy import linear_cross_entropy
+                w = lm_head.weight[:-2] # remove logits corresponding to MASK and CLS tokens
+                nll = linear_cross_entropy(x.view(-1, x.size(-1)), w, target_ids.view(-1),
+                                            reduction='none', impl=self.config.cce_impl).view(b, l)
+            nll = (nll * mask).sum(1) # carry-over masking
+            nll_per_head.append(nll)
+        nll_per_head = torch.stack(nll_per_head, dim=1) # (b, n_lm_heads)
+        nll = -torch.logsumexp(log_pi - nll_per_head, dim=1) # (b,)
+        elbo_loss = torch.mean(nll / p_mask) / l
+
+        balancing_loss = self.config.n_lm_heads * torch.sum(pi_argmax.mean(0) * pi.mean(0))
+        loss = elbo_loss + self.config.alpha * balancing_loss
+
+        with torch.no_grad():
+            mean_pi_entropy = entropy(pi.mean(0), dim=-1)
+            pi_entropy = torch.mean(entropy(pi, dim=-1))
+
+        scalars = {
+            'loss': loss.item(),
+            'elbo_loss': elbo_loss.item(),
+            'balancing_loss': balancing_loss.item(),
+            'mean_pi_entropy': mean_pi_entropy.item(),
+            'pi_entropy': pi_entropy.item(),
+        }
+        return x, loss, scalars
 
     @torch.no_grad
     def compute_ppl(self, idx, max_steps=1024):
@@ -285,3 +338,7 @@ class DiffusionGPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, n_steps):
         raise NotImplementedError
+
+
+def entropy(p, dim):
+    return torch.sum(torch.log(p.pow(-p)), dim)

@@ -1,7 +1,7 @@
 
 # diffusionGPT
 
-This project is a fork of famous [nanoGPT](https://github.com/karpathy/nanoGPT), which adds implementation of diffusion languauge models.
+This project is a fork of famous [nanoGPT](https://github.com/karpathy/nanoGPT) with implementation of diffusion language models added.
 
 ## install
 
